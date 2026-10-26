@@ -1,9 +1,12 @@
 import json
 import sqlite3
+import csv
+import io
 from datetime import datetime
 from itertools import combinations
 
 import streamlit as st
+import pandas as pd
 
 DB_PATH = "ruleguard.db"
 OPERATORS = ["==", "!=", ">", ">=", "<", "<="]
@@ -395,7 +398,7 @@ st.write(
 
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Manage Rules", "Analyze Rules", "Test Rules", "Issue Review", "Analysis History"],
+    ["Dashboard", "Manage Rules", "Analyze Rules", "Test Rules", "Bulk Test", "Import / Export", "Issue Review", "Analysis History"],
 )
 
 rules = get_rules()
@@ -612,3 +615,206 @@ elif page == "Analysis History":
                 st.write(f'Status: {issue["status"]}')
         else:
             st.write("No issues were recorded for this analysis.")
+
+
+
+elif page == "Bulk Test":
+    st.subheader("Bulk business decision testing")
+    st.write(
+        "Upload a CSV file containing columns that match the field names used by your active rules. "
+        "Each row is evaluated independently using the existing rule priorities."
+    )
+    active_rules = get_rules(active_only=True)
+    if not active_rules:
+        st.info("Create or activate rules before running a bulk test.")
+    else:
+        required_fields = sorted({rule["field"] for rule in active_rules})
+        st.write("Required input columns: " + ", ".join(required_fields))
+        uploaded_csv = st.file_uploader(
+            "Upload input data (CSV)",
+            type=["csv"],
+            key="bulk_test_csv",
+        )
+        if uploaded_csv is not None:
+            try:
+                input_df = pd.read_csv(uploaded_csv)
+                missing_fields = [field for field in required_fields if field not in input_df.columns]
+                if missing_fields:
+                    st.error("Missing required columns: " + ", ".join(missing_fields))
+                elif input_df.empty:
+                    st.warning("The uploaded CSV has no data rows.")
+                else:
+                    result_rows = []
+                    for row_number, row in input_df.iterrows():
+                        input_values = {}
+                        for field in required_fields:
+                            value = row[field]
+                            if pd.isna(value):
+                                input_values[field] = ""
+                            else:
+                                input_values[field] = value
+
+                        try:
+                            matched_rules = evaluate_inputs(active_rules, input_values)
+                            decisions = list(dict.fromkeys(rule["decision"] for rule in matched_rules))
+                            result_rows.append({
+                                "CSV Row": row_number + 2,
+                                **{field: row[field] for field in required_fields},
+                                "Matched Rule IDs": ", ".join(str(rule["rule_id"]) for rule in matched_rules),
+                                "Matched Rule Names": " | ".join(rule["name"] for rule in matched_rules),
+                                "Decision": decisions[0] if len(decisions) == 1 else (
+                                    "Conflict" if len(decisions) > 1 else "No Match"
+                                ),
+                                "Conflicting Decisions": " | ".join(decisions) if len(decisions) > 1 else "",
+                                "Evaluation Error": "",
+                            })
+                        except (ValueError, TypeError) as error:
+                            result_rows.append({
+                                "CSV Row": row_number + 2,
+                                **{field: row[field] for field in required_fields},
+                                "Matched Rule IDs": "",
+                                "Matched Rule Names": "",
+                                "Decision": "Evaluation Error",
+                                "Conflicting Decisions": "",
+                                "Evaluation Error": str(error),
+                            })
+
+                    result_df = pd.DataFrame(result_rows)
+                    total_rows = len(result_df)
+                    conflicts_count = int((result_df["Decision"] == "Conflict").sum())
+                    no_match_count = int((result_df["Decision"] == "No Match").sum())
+                    error_count = int((result_df["Decision"] == "Evaluation Error").sum())
+                    metric1, metric2, metric3, metric4 = st.columns(4)
+                    metric1.metric("Rows evaluated", total_rows)
+                    metric2.metric("Decision conflicts", conflicts_count)
+                    metric3.metric("No matching rule", no_match_count)
+                    metric4.metric("Evaluation errors", error_count)
+                    st.dataframe(result_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "Download bulk test results",
+                        data=result_df.to_csv(index=False),
+                        file_name="ruleguard_bulk_test_results.csv",
+                        mime="text/csv",
+                        key="download_bulk_test_results",
+                    )
+            except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as error:
+                st.error(f"Unable to read the uploaded CSV: {error}")
+
+elif page == "Import / Export":
+    st.subheader("Export rules")
+    current_rules = get_rules()
+    if current_rules:
+        export_df = pd.DataFrame(current_rules)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "Download rules as CSV",
+                data=export_df.to_csv(index=False),
+                file_name="ruleguard_rules.csv",
+                mime="text/csv",
+                key="export_rules_csv",
+            )
+        with col2:
+            st.download_button(
+                "Download rules as JSON",
+                data=json.dumps(current_rules, indent=2),
+                file_name="ruleguard_rules.json",
+                mime="application/json",
+                key="export_rules_json",
+            )
+    else:
+        st.info("There are no rules to export.")
+
+    st.divider()
+    st.subheader("Import rules")
+    st.write(
+        "Import a CSV or JSON file with rule definitions. Required fields are: "
+        "name, field, operator, value, value_type, decision. Optional fields are priority and active."
+    )
+    rules_file = st.file_uploader(
+        "Choose a rules CSV or JSON file",
+        type=["csv", "json"],
+        key="rules_import_file",
+    )
+    if rules_file is not None:
+        try:
+            file_bytes = rules_file.getvalue()
+            if rules_file.name.lower().endswith(".json"):
+                imported_data = json.loads(file_bytes.decode("utf-8"))
+                if isinstance(imported_data, dict):
+                    imported_data = imported_data.get("rules", [imported_data])
+                if not isinstance(imported_data, list):
+                    raise ValueError("JSON must contain a list of rule objects or an object with a 'rules' list.")
+                imported_rules = imported_data
+            else:
+                imported_rules = pd.read_csv(io.BytesIO(file_bytes)).to_dict(orient="records")
+
+            if not imported_rules:
+                st.warning("The selected file contains no rules.")
+            else:
+                required_columns = {"name", "field", "operator", "value", "value_type", "decision"}
+                missing_columns = required_columns - set(imported_rules[0].keys())
+                if missing_columns:
+                    st.error("Missing required fields: " + ", ".join(sorted(missing_columns)))
+                else:
+                    preview_rows = []
+                    validation_errors = []
+                    for index, item in enumerate(imported_rules, start=1):
+                        try:
+                            name = str(item.get("name", "")).strip()
+                            field = str(item.get("field", "")).strip()
+                            operator = str(item.get("operator", "")).strip()
+                            value = str(item.get("value", ""))
+                            value_type = str(item.get("value_type", "")).strip().lower()
+                            decision = str(item.get("decision", "")).strip()
+                            validate_rule(name, field, operator, value, value_type, decision)
+                            priority = int(item.get("priority", 100))
+                            active_raw = item.get("active", 1)
+                            if isinstance(active_raw, str):
+                                active = 1 if active_raw.strip().lower() in ("1", "true", "yes", "active") else 0
+                            else:
+                                active = 1 if bool(active_raw) else 0
+                            preview_rows.append({
+                                "name": name,
+                                "field": field,
+                                "operator": operator,
+                                "value": value,
+                                "value_type": value_type,
+                                "decision": decision,
+                                "priority": priority,
+                                "active": active,
+                            })
+                        except (ValueError, TypeError) as error:
+                            validation_errors.append(f"Row {index}: {error}")
+
+                    if validation_errors:
+                        st.error("Import cancelled because some rows are invalid.")
+                        st.dataframe(
+                            pd.DataFrame({"Validation error": validation_errors}),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.write(f"Validated rules ready to import: {len(preview_rows)}")
+                        st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+                        if st.button("Import validated rules", type="primary"):
+                            now = datetime.now().isoformat(timespec="seconds")
+                            with connect_db() as connection:
+                                connection.executemany(
+                                    """INSERT INTO rules
+                                    (name, field, operator, value, value_type, decision, priority, active, created_at)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    [
+                                        (
+                                            item["name"], item["field"], item["operator"],
+                                            item["value"], item["value_type"], item["decision"],
+                                            item["priority"], item["active"], now
+                                        )
+                                        for item in preview_rows
+                                    ],
+                                )
+                            st.success(f"Imported {len(preview_rows)} rule(s).")
+                            st.rerun()
+        except (json.JSONDecodeError, UnicodeDecodeError, pd.errors.ParserError, ValueError, TypeError) as error:
+            st.error(f"Unable to import rules: {error}")
+
