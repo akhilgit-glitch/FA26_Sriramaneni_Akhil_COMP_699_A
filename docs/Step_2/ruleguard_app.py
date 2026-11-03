@@ -206,6 +206,200 @@ def interval_for_rule(rule):
         "upper_inclusive": upper_inclusive,
     }
 
+def update_rule(rule_id, name, field, operator, value, value_type, decision, priority):
+    validate_rule(name, field, operator, value, value_type, decision)
+
+    if int(priority) < 1:
+        raise ValueError("Priority must be greater than zero.")
+
+    with connect_db() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE rules
+            SET name = ?, field = ?, operator = ?, value = ?,
+                value_type = ?, decision = ?, priority = ?
+            WHERE rule_id = ?
+            """,
+            (
+                name.strip(),
+                field.strip(),
+                operator,
+                str(value),
+                value_type,
+                decision,
+                int(priority),
+                int(rule_id)
+            )
+        )
+
+        if cursor.rowcount == 0:
+            raise ValueError(f"Rule ID {rule_id} was not found.")
+
+
+def get_rule_by_id(rule_id):
+    with connect_db() as connection:
+        row = connection.execute(
+            "SELECT * FROM rules WHERE rule_id = ?",
+            (int(rule_id),)
+        ).fetchone()
+
+        return dict(row) if row else None
+
+
+def get_rules_by_field(field, active_only=False):
+    query = "SELECT * FROM rules WHERE field = ?"
+    params = [field.strip()]
+
+    if active_only:
+        query += " AND active = 1"
+
+    query += " ORDER BY priority, rule_id"
+
+    with connect_db() as connection:
+        return [
+            dict(row)
+            for row in connection.execute(query, params).fetchall()
+        ]
+
+
+def search_rules(search_text, active_only=False):
+    search_text = search_text.strip()
+
+    if not search_text:
+        return []
+
+    query = """
+        SELECT * FROM rules
+        WHERE (
+            name LIKE ? OR
+            field LIKE ? OR
+            value LIKE ? OR
+            decision LIKE ?
+        )
+    """
+
+    search_value = f"%{search_text}%"
+    params = [search_value] * 4
+
+    if active_only:
+        query += " AND active = 1"
+
+    query += " ORDER BY priority, rule_id"
+
+    with connect_db() as connection:
+        return [
+            dict(row)
+            for row in connection.execute(query, params).fetchall()
+        ]
+
+
+def duplicate_rule(rule_id, new_name=None):
+    original = get_rule_by_id(rule_id)
+
+    if original is None:
+        raise ValueError(f"Rule ID {rule_id} was not found.")
+
+    if new_name is None:
+        new_name = f'Copy of {original["name"]}'
+
+    if not new_name.strip():
+        raise ValueError("Please enter a rule name.")
+
+    with connect_db() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO rules
+            (name, field, operator, value, value_type,
+             decision, priority, active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (
+                new_name.strip(),
+                original["field"],
+                original["operator"],
+                original["value"],
+                original["value_type"],
+                original["decision"],
+                original["priority"],
+                datetime.now().isoformat(timespec="seconds")
+            )
+        )
+
+        return cursor.lastrowid
+
+
+def get_issue_summary(analysis_id=None):
+    with connect_db() as connection:
+        query = "SELECT COUNT(*) FROM issues"
+        params = []
+
+        if analysis_id is not None:
+            query += " WHERE analysis_id = ?"
+            params.append(int(analysis_id))
+
+        total = connection.execute(query, params).fetchone()[0]
+
+        status_query = """
+            SELECT status, COUNT(*) AS total
+            FROM issues
+        """
+
+        type_query = """
+            SELECT issue_type, COUNT(*) AS total
+            FROM issues
+        """
+
+        if analysis_id is not None:
+            status_query += " WHERE analysis_id = ?"
+            type_query += " WHERE analysis_id = ?"
+
+        status_query += " GROUP BY status ORDER BY status"
+        type_query += " GROUP BY issue_type ORDER BY issue_type"
+
+        status_rows = connection.execute(
+            status_query, params
+        ).fetchall()
+
+        type_rows = connection.execute(
+            type_query, params
+        ).fetchall()
+
+        return {
+            "total_issues": total,
+            "by_status": {
+                row["status"]: row["total"]
+                for row in status_rows
+            },
+            "by_type": {
+                row["issue_type"]: row["total"]
+                for row in type_rows
+            }
+        }
+
+
+def delete_analysis(analysis_id):
+    with connect_db() as connection:
+        existing = connection.execute(
+            "SELECT analysis_id FROM analysis_runs WHERE analysis_id = ?",
+            (int(analysis_id),)
+        ).fetchone()
+
+        if existing is None:
+            raise ValueError(
+                f"Analysis ID {analysis_id} was not found."
+            )
+
+        connection.execute(
+            "DELETE FROM issues WHERE analysis_id = ?",
+            (int(analysis_id),)
+        )
+
+        connection.execute(
+            "DELETE FROM analysis_runs WHERE analysis_id = ?",
+            (int(analysis_id),)
+        )
+
+        return True
 
 def intervals_overlap(first, second):
     if first is None or second is None:
