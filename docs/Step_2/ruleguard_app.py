@@ -2,6 +2,7 @@ import json
 import sqlite3
 import csv
 import io
+import math
 from datetime import datetime
 from itertools import combinations
 
@@ -92,13 +93,23 @@ def get_rules(active_only=False):
 
 def parse_value(value, value_type):
     if value_type == "number":
-        return float(value)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("Enter a valid numeric condition value.")
+        if not math.isfinite(number):
+            raise ValueError("Numeric values must be finite.")
+        return number
     if value_type == "boolean":
+        if isinstance(value, bool):
+            return value
         normalized = str(value).strip().lower()
         if normalized not in ("true", "false"):
             raise ValueError("Boolean values must be true or false.")
         return normalized == "true"
-    return str(value)
+    if value_type == "text":
+        return str(value)
+    raise ValueError("Choose number, text, or boolean as the value type.")
 
 
 def validate_rule(name, field, operator, value, value_type, decision):
@@ -110,6 +121,8 @@ def validate_rule(name, field, operator, value, value_type, decision):
         raise ValueError("Choose a supported operator.")
     if decision not in DECISIONS:
         raise ValueError("Choose a supported decision.")
+    if value_type not in ("number", "text", "boolean"):
+        raise ValueError("Choose a supported value type.")
     parsed = parse_value(value, value_type)
     if value_type == "text" and operator not in ("==", "!="):
         raise ValueError("Text fields support only == and !=.")
@@ -179,32 +192,87 @@ def evaluate_rule(rule, input_values):
 def interval_for_rule(rule):
     if rule["value_type"] != "number":
         return None
-    value = float(rule["value"])
+
+    value = parse_value(rule["value"], "number")
     operator = rule["operator"]
-    lower = float("-inf")
-    upper = float("inf")
-    lower_inclusive = False
-    upper_inclusive = False
+    interval = {
+        "lower": float("-inf"),
+        "upper": float("inf"),
+        "lower_inclusive": False,
+        "upper_inclusive": False,
+        "excluded": set(),
+    }
 
     if operator == ">":
-        lower = value
+        interval["lower"] = value
     elif operator == ">=":
-        lower, lower_inclusive = value, True
+        interval["lower"] = value
+        interval["lower_inclusive"] = True
     elif operator == "<":
-        upper = value
+        interval["upper"] = value
     elif operator == "<=":
-        upper, upper_inclusive = value, True
+        interval["upper"] = value
+        interval["upper_inclusive"] = True
     elif operator == "==":
-        lower, upper = value, value
-        lower_inclusive, upper_inclusive = True, True
+        interval.update({
+            "lower": value,
+            "upper": value,
+            "lower_inclusive": True,
+            "upper_inclusive": True,
+        })
     elif operator == "!=":
-        return {"excluded": value}
-    return {
-        "lower": lower,
-        "upper": upper,
-        "lower_inclusive": lower_inclusive,
-        "upper_inclusive": upper_inclusive,
-    }
+        interval["excluded"].add(value)
+
+    return interval
+
+
+def intervals_overlap(first, second):
+    if first is None or second is None:
+        return None
+
+    lower = max(first["lower"], second["lower"])
+    upper = min(first["upper"], second["upper"])
+    excluded = first["excluded"] | second["excluded"]
+
+    if lower < upper:
+        return True
+    if lower > upper:
+        return False
+
+    allowed_by_first = (
+        (lower > first["lower"] or first["lower_inclusive"])
+        and (lower < first["upper"] or first["upper_inclusive"])
+        and lower not in first["excluded"]
+    )
+    allowed_by_second = (
+        (lower > second["lower"] or second["lower_inclusive"])
+        and (lower < second["upper"] or second["upper_inclusive"])
+        and lower not in second["excluded"]
+    )
+    return allowed_by_first and allowed_by_second and lower not in excluded
+
+
+def rules_overlap(first, second):
+    if first["value_type"] != second["value_type"]:
+        return None
+
+    value_type = first["value_type"]
+    if value_type == "number":
+        return intervals_overlap(interval_for_rule(first), interval_for_rule(second))
+
+    if value_type == "boolean":
+        candidates = (True, False)
+    else:
+        first_value = parse_value(first["value"], "text")
+        second_value = parse_value(second["value"], "text")
+        candidates = {first_value, second_value, "__ruleguard_other_value__"}
+
+    for candidate in candidates:
+        if evaluate_rule(first, {first["field"]: candidate}) and evaluate_rule(
+            second, {second["field"]: candidate}
+        ):
+            return True
+    return False
 
 def update_rule(rule_id, name, field, operator, value, value_type, decision, priority):
     validate_rule(name, field, operator, value, value_type, decision)
@@ -430,46 +498,28 @@ def format_condition(rule):
 
 
 def analyze_rules(rules):
-    # I compare active rules that use the same field and compatible value types.
+    # I compare active rules that use the same field and value type.
     active_rules = [rule for rule in rules if rule["active"]]
     issues = []
 
     for first, second in combinations(active_rules, 2):
         if first["field"] != second["field"]:
             continue
-        if first["value_type"] != second["value_type"]:
-            continue
 
-        overlap = intervals_overlap(
-            interval_for_rule(first), interval_for_rule(second)
-        )
+        overlap = rules_overlap(first, second)
         if overlap is False:
             continue
 
         if overlap is None:
-            try:
-                same_value = parse_value(first["value"], first["value_type"]) == parse_value(
-                    second["value"], second["value_type"]
-                )
-                if first["operator"] in ("==", "!=") and second["operator"] in ("==", "!="):
-                    sample_values = [first["value"], second["value"]]
-                    overlap = any(
-                        evaluate_rule(first, {first["field"]: value})
-                        and evaluate_rule(second, {second["field"]: value})
-                        for value in sample_values
-                    )
-                else:
-                    overlap = True
-            except (ValueError, TypeError):
-                overlap = None
-
-        if overlap is False:
-            continue
-
-        if first["decision"] != second["decision"]:
+            issue_type = "Manual overlap review"
+            explanation = (
+                f'Rules "{first["name"]}" and "{second["name"]}" use the same field, '
+                "but their value types differ. Their overlap cannot be evaluated safely."
+            )
+        elif first["decision"] != second["decision"]:
             issue_type = "Contradictory decisions"
             explanation = (
-                f'Rules "{first["name"]}" and "{second["name"]}" may both match '
+                f'Rules "{first["name"]}" and "{second["name"]}" can both match '
                 f'when {format_condition(first)} and {format_condition(second)} '
                 f'are satisfied, but they return "{first["decision"]}" and '
                 f'"{second["decision"]}".'
@@ -477,23 +527,18 @@ def analyze_rules(rules):
         else:
             issue_type = "Overlapping rules"
             explanation = (
-                f'Rules "{first["name"]}" and "{second["name"]}" may both match '
+                f'Rules "{first["name"]}" and "{second["name"]}" can both match '
                 f'when {format_condition(first)} and {format_condition(second)} '
                 f'are satisfied. Both return "{first["decision"]}".'
             )
 
-        if overlap is None:
-            explanation += " The overlap needs manual review because this condition combination is not fully analyzed."
-        issues.append(
-            {
-                "issue_type": issue_type,
-                "rule_ids": [first["rule_id"], second["rule_id"]],
-                "explanation": explanation,
-            }
-        )
+        issues.append({
+            "issue_type": issue_type,
+            "rule_ids": [first["rule_id"], second["rule_id"]],
+            "explanation": explanation,
+        })
 
     return issues
-
 
 def save_analysis(rules, issues):
     snapshot = json.dumps(rules)
@@ -581,7 +626,6 @@ def display_rule(rule):
 # I keep the full proof of concept in one Streamlit file.
 st.set_page_config(page_title="RuleGuard", page_icon=None, layout="wide")
 initialize_db()
-seed_rules()
 
 st.title("RuleGuard")
 st.caption("Business Rule Conflict Detection and Resolution System")
@@ -596,6 +640,9 @@ page = st.sidebar.radio(
 )
 
 rules = get_rules()
+
+if not rules:
+    st.info("No business rules are stored yet. Create your first rule in Manage Rules to begin.")
 
 if page == "Dashboard":
     active_rules = [rule for rule in rules if rule["active"]]
@@ -627,10 +674,10 @@ elif page == "Manage Rules":
     st.subheader("Create a rule")
     with st.form("create_rule_form", clear_on_submit=True):
         name = st.text_input("Rule name")
-        field = st.text_input("Field name", value="amount")
+        field = st.text_input("Field name")
         value_type = st.selectbox("Value type", ["number", "text", "boolean"])
         operator = st.selectbox("Operator", OPERATORS)
-        value = st.text_input("Condition value", value="1000")
+        value = st.text_input("Condition value")
         decision = st.selectbox("Expected decision", DECISIONS)
         priority = st.number_input("Priority (lower number runs first)", min_value=1, max_value=10000, value=100)
         submitted = st.form_submit_button("Save rule")
@@ -642,39 +689,107 @@ elif page == "Manage Rules":
             except (ValueError, sqlite3.Error) as error:
                 st.error(str(error))
 
-    st.subheader("Saved rules")
-    if rules:
-        st.dataframe([display_rule(rule) for rule in rules], use_container_width=True, hide_index=True)
-        rule_options = {
-            f'{rule["rule_id"]}: {rule["name"]}': rule for rule in rules
-        }
-        selected_label = st.selectbox("Select a rule to manage", list(rule_options))
+    st.divider()
+    st.subheader("Find and manage saved rules")
+    search_text = st.text_input("Search by rule name, field, value, or decision", key="rule_search")
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        active_filter = st.selectbox("Status filter", ["All", "Active", "Inactive"])
+    with filter_col2:
+        field_options = ["All"] + sorted({rule["field"] for rule in rules})
+        field_filter = st.selectbox("Field filter", field_options)
+
+    filtered_rules = search_rules(search_text) if search_text.strip() else get_rules()
+    if active_filter == "Active":
+        filtered_rules = [rule for rule in filtered_rules if rule["active"]]
+    elif active_filter == "Inactive":
+        filtered_rules = [rule for rule in filtered_rules if not rule["active"]]
+    if field_filter != "All":
+        filtered_rules = [rule for rule in filtered_rules if rule["field"] == field_filter]
+
+    if filtered_rules:
+        st.dataframe(
+            [display_rule(rule) for rule in filtered_rules],
+            use_container_width=True,
+            hide_index=True,
+        )
+        rule_options = {f'{rule["rule_id"]}: {rule["name"]}': rule for rule in filtered_rules}
+        selected_label = st.selectbox("Select a rule", list(rule_options))
         selected_rule = rule_options[selected_label]
-        col1, col2 = st.columns(2)
-        with col1:
-            new_active = st.checkbox(
-                "Rule is active",
-                value=bool(selected_rule["active"]),
-                key=f'active_{selected_rule["rule_id"]}',
-            )
-            if st.button("Update active status"):
-                set_rule_active(selected_rule["rule_id"], new_active)
-                st.success("Rule status updated.")
-                st.rerun()
-        with col2:
-            confirm_delete = st.checkbox(
-                "Confirm rule deletion",
-                key=f'delete_confirm_{selected_rule["rule_id"]}',
-            )
-            if st.button("Delete selected rule"):
-                if confirm_delete:
-                    delete_rule(selected_rule["rule_id"])
-                    st.success("Rule deleted.")
+
+        with st.expander("Edit selected rule"):
+            with st.form(f'edit_rule_form_{selected_rule["rule_id"]}'):
+                edit_name = st.text_input("Rule name", value=selected_rule["name"])
+                edit_field = st.text_input("Field name", value=selected_rule["field"])
+                edit_type = st.selectbox(
+                    "Value type", ["number", "text", "boolean"],
+                    index=["number", "text", "boolean"].index(selected_rule["value_type"]),
+                )
+                edit_operator = st.selectbox(
+                    "Operator", OPERATORS, index=OPERATORS.index(selected_rule["operator"])
+                )
+                edit_value = st.text_input("Condition value", value=selected_rule["value"])
+                edit_decision = st.selectbox(
+                    "Expected decision", DECISIONS,
+                    index=DECISIONS.index(selected_rule["decision"]),
+                )
+                edit_priority = st.number_input(
+                    "Priority", min_value=1, max_value=10000,
+                    value=int(selected_rule["priority"]),
+                )
+                save_edit = st.form_submit_button("Save rule changes")
+                if save_edit:
+                    try:
+                        update_rule(
+                            selected_rule["rule_id"], edit_name, edit_field,
+                            edit_operator, edit_value, edit_type,
+                            edit_decision, edit_priority,
+                        )
+                        st.success("Rule updated.")
+                        st.rerun()
+                    except (ValueError, sqlite3.Error) as error:
+                        st.error(str(error))
+
+        action_col1, action_col2, action_col3 = st.columns(3)
+        with action_col1:
+            if selected_rule["active"]:
+                if st.button("Deactivate rule"):
+                    set_rule_active(selected_rule["rule_id"], False)
+                    st.success("Rule deactivated.")
                     st.rerun()
+            else:
+                if st.button("Activate rule"):
+                    set_rule_active(selected_rule["rule_id"], True)
+                    st.success("Rule activated.")
+                    st.rerun()
+        with action_col2:
+            duplicate_name = st.text_input(
+                "Copy name", value=f'Copy of {selected_rule["name"]}',
+                key=f'duplicate_name_{selected_rule["rule_id"]}',
+            )
+            if st.button("Duplicate rule"):
+                try:
+                    new_id = duplicate_rule(selected_rule["rule_id"], duplicate_name)
+                    st.success(f"Rule duplicated as ID {new_id}. The copy is inactive until activated.")
+                    st.rerun()
+                except (ValueError, sqlite3.Error) as error:
+                    st.error(str(error))
+        with action_col3:
+            confirm_delete = st.checkbox(
+                "Confirm permanent deletion", key=f'delete_confirm_{selected_rule["rule_id"]}'
+            )
+            if st.button("Delete rule"):
+                if confirm_delete:
+                    try:
+                        delete_rule(selected_rule["rule_id"])
+                        st.success("Rule deleted.")
+                        st.rerun()
+                    except sqlite3.Error as error:
+                        st.error(str(error))
                 else:
-                    st.warning("Select the confirmation checkbox first.")
+                    st.warning("Confirm deletion before proceeding.")
     else:
-        st.info("No rules have been created.")
+        st.info("No rules match the selected filters. Create a rule or change the search filters.")
 
 elif page == "Analyze Rules":
     st.subheader("Run conflict detection")
@@ -738,11 +853,20 @@ elif page == "Test Rules":
                         use_container_width=True,
                         hide_index=True,
                     )
+                    winning_rule = min(matched, key=lambda rule: (rule["priority"], rule["rule_id"]))
                     decisions = sorted({rule["decision"] for rule in matched})
+                    st.metric("Effective decision", winning_rule["decision"])
+                    st.write(
+                        f'Winning rule: {winning_rule["name"]} '
+                        f'(priority {winning_rule["priority"]}, rule ID {winning_rule["rule_id"]}).'
+                    )
                     if len(decisions) > 1:
-                        st.warning("The matched rules return different decisions. Review their priority and conditions.")
+                        st.warning(
+                            "Multiple matched rules return different decisions. "
+                            "The lowest priority number is applied as the effective decision; review the other matches."
+                        )
                     else:
-                        st.write(f"Decision returned by matched rules: {decisions[0]}")
+                        st.write("All matched rules agree on the decision.")
                 else:
                     st.info("No active rule matched these input values.")
             except (ValueError, TypeError) as error:
@@ -754,6 +878,15 @@ elif page == "Issue Review":
     if not issues:
         st.info("No saved issues are available. Run an analysis first.")
     else:
+        issue_summary = get_issue_summary()
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("Total issues", issue_summary["total_issues"])
+        summary_cols[1].metric("Open", issue_summary["by_status"].get("Open", 0))
+        summary_cols[2].metric("Under review", issue_summary["by_status"].get("Under review", 0))
+        summary_cols[3].metric("Resolved", issue_summary["by_status"].get("Resolved", 0))
+        issue_filter = st.selectbox("Show issues", ["All", "Open", "Under review", "Resolved"])
+        if issue_filter != "All":
+            issues = [issue for issue in issues if issue["status"] == issue_filter]
         for issue in issues:
             with st.expander(
                 f'Issue #{issue["issue_id"]}: {issue["issue_type"]} — {issue["status"]}'
@@ -810,6 +943,21 @@ elif page == "Analysis History":
         else:
             st.write("No issues were recorded for this analysis.")
 
+        st.divider()
+        confirm_analysis_delete = st.checkbox(
+            f"Confirm deletion of analysis #{selected_id} and its issues",
+            key=f"delete_analysis_confirm_{selected_id}",
+        )
+        if st.button("Delete selected analysis", key=f"delete_analysis_{selected_id}"):
+            if confirm_analysis_delete:
+                try:
+                    delete_analysis(selected_id)
+                    st.success(f"Analysis #{selected_id} and its issues were deleted.")
+                    st.rerun()
+                except (ValueError, sqlite3.Error) as error:
+                    st.error(str(error))
+            else:
+                st.warning("Confirm the analysis deletion first.")
 
 
 elif page == "Bulk Test":
@@ -946,6 +1094,8 @@ elif page == "Import / Export":
             if not imported_rules:
                 st.warning("The selected file contains no rules.")
             else:
+                if not all(isinstance(item, dict) for item in imported_rules):
+                    raise ValueError("Every imported rule must be a JSON object or CSV row.")
                 required_columns = {"name", "field", "operator", "value", "value_type", "decision"}
                 missing_columns = required_columns - set(imported_rules[0].keys())
                 if missing_columns:
@@ -963,6 +1113,8 @@ elif page == "Import / Export":
                             decision = str(item.get("decision", "")).strip()
                             validate_rule(name, field, operator, value, value_type, decision)
                             priority = int(item.get("priority", 100))
+                            if priority < 1 or priority > 10000:
+                                raise ValueError("Priority must be between 1 and 10000.")
                             active_raw = item.get("active", 1)
                             if isinstance(active_raw, str):
                                 active = 1 if active_raw.strip().lower() in ("1", "true", "yes", "active") else 0
